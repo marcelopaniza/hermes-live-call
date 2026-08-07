@@ -1,0 +1,58 @@
+name: live_call
+version: 0.1.0
+description: >
+  Live voice calls with your Hermes agent. The agent mints a one-time HTTPS
+  link ("tap to join"); the phone browser streams microphone audio over a
+  secure WebSocket to a room server on this machine, which runs a realtime
+  speech model (Gemini Live by default) speaking as your configured assistant
+  persona — with its memory and the conversation that requested the call. Each
+  session writes a markdown transcript to the Hermes workspace. Explicit by
+  design: rooms exist only when a call is requested, links are single-use with
+  a short TTL, one room at a time, and media terminates on this machine only.
+  Camera vision and MP4 recording are planned, not yet shipped.
+author: Marcelo Paniza
+license: MIT
+homepage: https://github.com/marcelopaniza/hermes-live-call
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - call_start
+  - call_status
+  - call_end
+hooks:
+  - on_session_end
+optional_env:
+  - name: GEMINI_API_KEY
+    description: "Google AI Studio key for Gemini Live. Without it the plugin runs an echo pipeline (your voice is played back) so the audio path can still be verified."
+    prompt: "Gemini API key"
+    password: true
+  - name: LIVE_CALL_PUBLIC_URL
+    description: "Stable public base URL for join links (named tunnel, reverse proxy). Omit to use the bundled Cloudflare quick-tunnel supervisor."
+    prompt: "Public base URL (optional)"
+    password: false
+  - name: LIVE_CALL_BIND
+    description: "host:port the room server binds locally (default 127.0.0.1:8199). Keep it on loopback."
+    prompt: "Bind address (optional)"
+    password: false
+  - name: LIVE_CALL_MODEL
+    description: "Realtime model id (default gemini-3.1-flash-live-preview)."
+    prompt: "Realtime model (optional)"
+    password: false
+  - name: LIVE_CALL_PIPELINE
+    description: "Force a pipeline: 'echo' (no key needed) or 'gemini'. Default: gemini when a key is present."
+    prompt: "Pipeline (optional)"
+    password: false
+  - name: LIVE_CALL_SYSTEM_FILE
+    description: "Path to a file that replaces the assembled persona prompt."
+    prompt: "System prompt file (optional)"
+    password: false
+  - name: LIVE_CALL_CONTEXT
+    description: "Set to 0 to stop injecting memory and recent-conversation context into calls."
+    prompt: "Inject context? (1/0)"
+    password: false
+  - name: LIVE_CALL_RECORDINGS_DIR
+    description: "Where transcripts and logs are written (default $HERMES_HOME/workspace/live_calls)."
+    prompt: "Transcripts directory (optional)"
+    password: false

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hermes Live Call</title>
+<style>
+  :root { color-scheme: dark light; }
+  body { margin:0; font-family:system-ui,-apple-system,sans-serif; background:#0e1116; color:#e6e8eb;
+         min-height:100dvh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; padding:20px; box-sizing:border-box; }
+  h1 { font-size:1.15rem; font-weight:600; margin:0; letter-spacing:.02em; }
+  #banner { display:none; background:#5c3d00; color:#ffd88a; padding:10px 14px; border-radius:10px; font-size:.9rem; max-width:420px; }
+  video { display:none; width:min(92vw,380px); aspect-ratio:3/4; background:#000; border-radius:14px; object-fit:cover; }
+  button { font-size:1.05rem; padding:14px 28px; border-radius:999px; border:0; background:#2f6fed; color:#fff; font-weight:600; }
+  button.danger { background:#c43c3c; }
+  button:disabled { opacity:.5; }
+  #status { font-size:.9rem; opacity:.85; min-height:1.2em; text-align:center; max-width:420px; }
+  #meter { width:min(92vw,380px); height:8px; border-radius:99px; background:#222a35; overflow:hidden; }
+  #meterFill { height:100%; width:0%; background:#3ddc84; transition:width .08s linear; }
+</style>
+</head>
+<body>
+  <h1>📞 Hermes Live Call</h1>
+  <div id="banner">This looks like an in-app browser, which may block the microphone.
+    Tap the menu (⋯ / ⇧) and choose <b>Open in Chrome/Safari</b>, then try again.</div>
+  <video id="preview" autoplay playsinline muted></video>
+  <div id="meter"><div id="meterFill"></div></div>
+  <button id="join">Join call</button>
+  <div id="status">audio streams over a secure WebSocket — works on any network</div>
+
+<script>
+(() => {
+  const token = location.pathname.split("/").pop();
+  const statusEl = document.getElementById("status");
+  const joinBtn = document.getElementById("join");
+  const meterFill = document.getElementById("meterFill");
+  const preview = document.getElementById("preview");
+  const say = (m) => { statusEl.textContent = m; };
+
+  const ua = navigator.userAgent || "";
+  const inApp = /\bFBAN|FBAV|Instagram|Line\/|MicroMessenger|GSA\/|wv\)|; wv/i.test(ua)
+                || (!/Safari/i.test(ua) && /iPhone|iPad/i.test(ua));
+  if (inApp || !navigator.mediaDevices?.getUserMedia) {
+    document.getElementById("banner").style.display = "block";
+  }
+
+  let phase = "idle";               // idle | connecting | live | ended
+  let ws = null, micCtx = null, playCtx = null, stream = null, node = null, src = null;
+  let playHead = 0, cfg = null;
+
+  function cleanup(msg) {
+    phase = "ended";
+    try { ws && ws.close(); } catch (_) {}
+    try { node && node.disconnect(); src && src.disconnect(); } catch (_) {}
+    try { stream && stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    try { micCtx && micCtx.close(); playCtx && playCtx.close(); } catch (_) {}
+    ws = null; node = null; src = null; stream = null; micCtx = null; playCtx = null;
+    meterFill.style.width = "0%";
+    preview.style.display = "none";
+    joinBtn.textContent = "Call ended";
+    joinBtn.classList.remove("danger");
+    joinBtn.disabled = true;
+    if (msg) say(msg);
+  }
+
+  function playPCM(buf) {
+    if (!playCtx) return;
+    const pcm = new Int16Array(buf);
+    const f32 = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
+    const ab = playCtx.createBuffer(1, f32.length, cfg.outRate);
+    ab.getChannelData(0).set(f32);
+    const s = playCtx.createBufferSource();
+    s.buffer = ab;
+    s.connect(playCtx.destination);
+    const now = playCtx.currentTime;
+    if (playHead < now + 0.02) playHead = now + 0.02;   // small jitter cushion
+    s.start(playHead);
+    playHead += ab.duration;
+  }
+
+  async function start() {
+    phase = "connecting";
+    joinBtn.disabled = true;
+    try {
+      say("fetching room config…");
+      const r = await fetch(`/config?token=${encodeURIComponent(token)}`);
+      if (!r.ok) { cleanup("room rejected this link (expired or already used)"); return; }
+      cfg = await r.json();
+
+      say("requesting " + (cfg.mode === "video" ? "camera + mic" : "mic") + "…");
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: cfg.mode === "video" ? { facingMode: "environment", width: 640, height: 480 } : false,
+      });
+      if (cfg.mode === "video") { preview.srcObject = stream; preview.style.display = "block"; }
+
+      // Contexts created inside the tap gesture so mobile autoplay rules pass.
+      micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: cfg.inRate });
+      playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: cfg.outRate });
+      await micCtx.resume(); await playCtx.resume();
+      playHead = 0;
+
+      say("connecting…");
+      const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") +
+                    location.host + "/ws?token=" + encodeURIComponent(token);
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+
+      const guard = setTimeout(() => {
+        if (phase === "connecting") cleanup("could not reach the room (no WebSocket). Tell Hermes.");
+      }, 15000);
+
+      ws.onopen = () => {
+        clearTimeout(guard);
+        phase = "live";
+        say(cfg.pipeline === "echo" ? "connected — say something, you'll hear it back 🎙️"
+                                    : "connected — talk now 🎙️");
+        joinBtn.textContent = "Hang up";
+        joinBtn.classList.add("danger");
+        joinBtn.disabled = false;
+
+        src = micCtx.createMediaStreamSource(stream);
+        node = micCtx.createScriptProcessor(2048, 1, 1);   // widest mobile support
+        node.onaudioprocess = (ev) => {
+          if (!ws || ws.readyState !== 1) return;
+          const f32 = ev.inputBuffer.getChannelData(0);
+          const pcm = new Int16Array(f32.length);
+          let peak = 0;
+          for (let i = 0; i < f32.length; i++) {
+            const s = Math.max(-1, Math.min(1, f32[i]));
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            const a = Math.abs(s); if (a > peak) peak = a;
+          }
+          meterFill.style.width = Math.min(100, peak * 140).toFixed(0) + "%";
+          ws.send(pcm.buffer);
+        };
+        src.connect(node);
+        node.connect(micCtx.destination);   // Safari needs the chain terminated
+      };
+      ws.onmessage = (ev) => { if (ev.data instanceof ArrayBuffer) playPCM(ev.data); };
+      ws.onerror = () => { if (phase !== "ended") cleanup("connection error — tell Hermes"); };
+      ws.onclose = (ev) => {
+        if (phase === "ended") return;
+        if (ev.code === 4409) cleanup("someone is already on this call");
+        else if (ev.code === 4403) cleanup("this link is no longer valid");
+        else cleanup("call ended");
+      };
+    } catch (e) {
+      cleanup((e && e.name === "NotAllowedError")
+        ? "mic/camera permission denied — check browser settings"
+        : "error: " + (e.message || e));
+      phase = "idle";
+      joinBtn.disabled = false;
+      joinBtn.textContent = "Join call";
+    }
+  }
+
+  joinBtn.addEventListener("click", () => {
+    if (phase === "idle") start();
+    else if (phase === "live") cleanup("call ended");
+  });
+})();
+</script>
+</body>
+</html>

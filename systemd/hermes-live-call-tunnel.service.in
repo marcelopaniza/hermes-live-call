@@ -1,0 +1,21 @@
+[Unit]
+Description=Hermes live_call room tunnel
+Documentation=https://github.com/marcelopaniza/hermes-live-call
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="HERMES_HOME=@HERMES_HOME@"
+Environment="LIVE_CALL_BIND=127.0.0.1:8199"
+ExecStart=@PYTHON@ @PLUGIN_DIR@/tunnel_supervisor.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@HERMES_HOME@
+
+[Install]
+WantedBy=default.target

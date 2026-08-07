@@ -1,0 +1,7 @@
+# Room-server dependencies. These install into the plugin's OWN venv — never
+# into the Hermes gateway environment (the room server runs as a subprocess).
+pipecat-ai[google]>=1.7,<2
+fastapi>=0.115
+uvicorn>=0.30
+websockets>=12
+PyYAML>=6

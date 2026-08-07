@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+recordings/
+bin/cloudflared
+*.mp4
+*.log
+.pytest_cache/
+tunnel_url.txt
+room.json
