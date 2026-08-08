@@ -156,14 +156,31 @@ and any failure degrades to less context rather than a failed call.
 
 ## Security notes
 
+Reviewed adversarially before release (assuming an attacker knows the public
+hostname but not a token). Fixed as a result: memory was gated on a *display
+name*, which the other party chooses — now gated on the chat's stable platform
+id, bound to the caller at mint time so a link tapped later cannot pick up
+whoever spoke most recently; a used token could start a second call once the
+first ended; two callers could race the same link; `/control/stop` was
+reachable from the internet; `/healthz` told the public whether you were on a
+call; comparisons were not constant-time; transcripts inherited the umask.
+
+Known and accepted: the join token appears in the URL (browser history and
+your tunnel provider's logs — inherent to "tap a link"), `/healthz` still
+answers liveness publicly (the tunnel supervisor needs it), and dependencies
+are version-ranged rather than hash-locked.
+
 - Join links are single-use with a 128-bit token and a TTL; the room self-closes
   when the call ends and reaps itself if the link is never used.
 - The room server binds to loopback; only five routes are exposed (join page,
   config read, audio socket, health, secret-guarded stop).
 - The health endpoint is public through the tunnel and deliberately exposes no
   filesystem paths.
-- Recordings/transcripts stay on the host. Recording anyone else requires their
-  consent — check your jurisdiction.
+- Recordings/transcripts stay on the host, written `0600` in a `0700`
+  directory. Recording anyone else requires their consent — check your
+  jurisdiction.
+- Calls are capped at `LIVE_CALL_MAX_CALL_S` (default 30 min) so a held-open
+  line cannot run up model cost or squat the single room slot.
 
 ## Development
 

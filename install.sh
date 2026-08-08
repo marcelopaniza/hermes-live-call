@@ -49,10 +49,16 @@ if [[ $WANT_TUNNEL -eq 1 && -z "$CLOUDFLARED" ]]; then
   mkdir -p "$PLUGIN_DIR/bin"
   arch="$(uname -m)"; case "$arch" in x86_64) a=amd64;; aarch64|arm64) a=arm64;; *) a="";; esac
   if [[ -n "$a" ]]; then
+    # Pinned rather than "latest" so installs are reproducible; the checksum is
+    # printed so you can compare it against Cloudflare's published release
+    # before trusting a binary that then runs as a persistent service.
+    ver="${CLOUDFLARED_VERSION:-2026.7.3}"
     curl -fsSL -o "$PLUGIN_DIR/bin/cloudflared" \
-      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$a"
+      "https://github.com/cloudflare/cloudflared/releases/download/$ver/cloudflared-linux-$a"
     chmod +x "$PLUGIN_DIR/bin/cloudflared"
     CLOUDFLARED="$PLUGIN_DIR/bin/cloudflared"
+    say "cloudflared $ver sha256: $(sha256sum "$CLOUDFLARED" | cut -d" " -f1)"
+    say "verify against https://github.com/cloudflare/cloudflared/releases/tag/$ver"
   else
     say "unknown arch $arch — install cloudflared yourself, or use --no-tunnel"
   fi

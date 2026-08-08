@@ -29,6 +29,7 @@ import hmac
 import json
 import os
 import signal
+import socket
 import sys
 import time
 import uuid
@@ -68,6 +69,9 @@ PIPELINE = os.environ.get("LIVE_CALL_PIPELINE", "echo")
 MODEL = os.environ.get("LIVE_CALL_MODEL", "gemini-3.1-flash-live-preview")
 NOTE = os.environ.get("LIVE_CALL_NOTE", "")
 TTL_S = int(os.environ.get("LIVE_CALL_TTL_S", "0") or 0)
+# Hard cap so a held-open call cannot bill indefinitely or squat the only room.
+MAX_CALL_S = int(os.environ.get("LIVE_CALL_MAX_CALL_S", "1800") or 0)
+CONTEXT_FILE = os.environ.get("LIVE_CALL_CONTEXT_FILE", "")
 # Identity so a caller-side health probe can tell THIS room from an orphan
 # still holding the port (an orphan once made a fresh link 404).
 INSTANCE = os.environ.get("LIVE_CALL_INSTANCE") or uuid.uuid4().hex
@@ -84,6 +88,7 @@ STATE = {
     "stopping": False,
     "recording_path": None,   # TODO: MP4 recording
     "transcript_path": None,
+    "call_started": None,
     "images": 0,
 }
 
@@ -114,7 +119,19 @@ def _persona() -> str:
     """Same identity as the chat assistant (SOUL.md + active personality)."""
     import persona as persona_mod
 
+    snapshot = ""
+    if CONTEXT_FILE and Path(CONTEXT_FILE).exists():
+        try:
+            snapshot = Path(CONTEXT_FILE).read_text(encoding="utf-8").strip()
+        except OSError:
+            snapshot = ""
+    if snapshot:
+        # Attributed to the caller when the link was minted; recomputing here
+        # would follow whoever spoke most recently instead.
+        os.environ["LIVE_CALL_CONTEXT"] = "0"
     text = persona_mod.build(mode=MODE, note=NOTE)
+    if snapshot:
+        text = f"{text}\n\n{snapshot}"
     name, _ = persona_mod.active_personality()
     log(f"persona: {name or 'default'} ({len(text)} chars)")
     return text
@@ -151,6 +168,10 @@ class TranscriptWriter(FrameProcessor):
         self._speaker = speaker
         self._pending: list[str] = []
         path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)   # transcripts are private
+        except OSError:
+            pass
         path.write_text(f"# live_call transcript — started {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n",
                         encoding="utf-8")
         os.chmod(path, 0o600)   # a call transcript is private by default
@@ -230,7 +251,7 @@ async def _run_call(websocket: WebSocket) -> None:
             audio_out_enabled=True,
             add_wav_header=False,
             serializer=serializer,
-            session_timeout=None,
+            session_timeout=MAX_CALL_S or None,
         ),
     )
 
@@ -246,6 +267,7 @@ async def _run_call(websocket: WebSocket) -> None:
     @transport.event_handler("on_client_connected")
     async def _on_conn(_t, _ws):
         STATE["joined"] = True
+        STATE["call_started"] = time.time()
         log("client connected — audio flowing")
         if PIPELINE == "gemini":
             # Speak first: proves the model→caller audio path immediately and
@@ -276,7 +298,7 @@ async def _run_call(websocket: WebSocket) -> None:
 # HTTP / WS
 # ---------------------------------------------------------------------------
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)  # no public API console
 
 
 @app.get("/join/{token}")
@@ -370,6 +392,10 @@ async def _watchdog() -> None:
         elif STATE["used"] and not STATE["joined"] and (_call_task is None or _call_task.done()):
             log("call finished — self-terminating")
             _stop_event.set()
+        elif MAX_CALL_S and STATE["joined"] and STATE["call_started"] \
+                and time.time() - STATE["call_started"] > MAX_CALL_S:
+            log(f"call exceeded {MAX_CALL_S}s — ending it")
+            _stop_event.set()
 
 
 def _write_state() -> None:
@@ -377,14 +403,17 @@ def _write_state() -> None:
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
-            "instance": INSTANCE,
-            "pid": os.getpid(),
-            "bind": BIND,
-            "secret": SECRET,
-            "started": STATE["started"],
-        }), encoding="utf-8")
-        os.chmod(tmp, 0o600)
+        # Create with 0600 rather than write-then-chmod: the state file holds
+        # the control secret, and the gap would be world-readable.
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "instance": INSTANCE,
+                "pid": os.getpid(),
+                "bind": BIND,
+                "secret": SECRET,
+                "started": STATE["started"],
+            }))
         os.replace(tmp, STATE_FILE)
     except OSError as e:
         log(f"could not write state file: {e}")
@@ -411,21 +440,41 @@ async def amain() -> int:
         loop.add_signal_handler(sig, _stop_event.set)
 
     host, _, port = BIND.partition(":")
+    host, port = (host or "127.0.0.1"), int(port or 8199)
+
+    # A room that was just retired can still hold the listening socket for a
+    # moment after it stops answering health checks. Wait for the port instead
+    # of racing it — losing that race used to surface as a useless
+    # "could not bind ... : None" and a failed call.
+    bound = False
+    for attempt in range(1, 9):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((host, port))
+            bound = True
+        except OSError as e:
+            log(f"port {host}:{port} busy ({e}); retry {attempt}/8")
+        finally:
+            probe.close()
+        if bound:
+            break
+        await asyncio.sleep(0.75)
+    if not bound:
+        log(f"FATAL: could not bind {host}:{port} — another room server is holding it")
+        return 3
+
     server = uvicorn.Server(uvicorn.Config(
-        app, host=host or "127.0.0.1", port=int(port or 8199),
-        log_level="warning", access_log=False,
+        app, host=host, port=port, log_level="warning", access_log=False,
     ))
     # State must exist BEFORE the first health response: callers use it to find
     # and retire this room, and healthz starts answering the instant uvicorn
     # serves — a later write loses that race and leaves the room unstoppable.
     _write_state()
     serve_task = asyncio.create_task(server.serve())
-    # Fail loudly if the port is already owned: a silent bind failure once let
-    # call_start hand out a token no running room recognised (404 for the user).
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.3)
     if serve_task.done():
-        exc = serve_task.exception()
-        log(f"FATAL: could not bind {BIND}: {exc}")
+        log(f"FATAL: server exited during startup: {serve_task.exception()!r}")
         _clear_state()
         return 3
     watchdog = asyncio.create_task(_watchdog())

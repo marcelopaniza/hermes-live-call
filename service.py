@@ -20,6 +20,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -116,6 +117,21 @@ def _published_tunnel() -> Optional[str]:
         pass
     logger.warning("live_call: published tunnel %s is not answering", url)
     return None
+
+
+def _supervisor_present() -> bool:
+    """Is an always-on tunnel supervisor managing this host's public URL?"""
+    state_dir = Path(os.environ.get("LIVE_CALL_STATE_DIR", str(_recordings_dir())))
+    if (state_dir / "tunnel_url.txt").exists():
+        return True
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "hermes-live-call-tunnel.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return res.stdout.strip() in {"enabled", "static", "enabled-runtime"}
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _cloudflared() -> Optional[str]:
@@ -277,6 +293,24 @@ def _room_state_file() -> Path:
     return _recordings_dir() / "room.json"
 
 
+def _is_room_pid(pid: int) -> bool:
+    """Confirm the pid is still OUR room server — pids get recycled, and
+    signalling a stranger because a state file went stale is unacceptable."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return False
+    return "room_server.py" in cmdline
+
+
+def _port_free() -> bool:
+    """A retired room stops answering health before it releases the socket."""
+    host, _, port = _bind().partition(":")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host or "127.0.0.1", int(port or 8199))) != 0
+
+
 def _clear_foreign_room() -> None:
     """Retire a room left behind by an earlier process before we bind the port.
 
@@ -315,12 +349,12 @@ def _clear_foreign_room() -> None:
     pid = state.get("pid")
     deadline = time.time() + 8
     while time.time() < deadline:
-        if not _healthz(timeout=1):
+        if not _healthz(timeout=1) and _port_free():
             logger.info("live_call: retired an orphaned room (pid=%s)", pid)
             return
         time.sleep(0.5)
 
-    if isinstance(pid, int):
+    if isinstance(pid, int) and _is_room_pid(pid):
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.kill(pid, sig)
@@ -360,6 +394,26 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
         rec_dir = _recordings_dir()
         log_path = rec_dir / "room_server.log"
 
+        # Snapshot the caller's context NOW. Resolving it when the link is
+        # tapped means whichever chat spoke most recently wins — so a
+        # non-owner's link, tapped after the owner happens to message, would
+        # open with the OWNER's memory and conversation. Minting time is the
+        # only moment we can attribute the request correctly.
+        ctx_path = None
+        try:
+            sys.path.insert(0, str(ROOT))
+            import context as _context  # noqa: PLC0415
+
+            block = _context.build(note=note)
+            if block:
+                ctx_path = rec_dir / f"context-{token[:8]}.txt"
+                fd = os.open(ctx_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(block)
+        except Exception as e:  # noqa: BLE001 — context is a bonus, not a gate
+            logger.warning("live_call: could not snapshot context: %s", e)
+
+
         env = dict(os.environ)
         env.update({
             "LIVE_CALL_TOKEN": token,
@@ -372,6 +426,7 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
             "LIVE_CALL_NOTE": note,
             "LIVE_CALL_TTL_S": str(ttl_minutes * 60),
             "LIVE_CALL_RECORDINGS_DIR": str(rec_dir),
+            "LIVE_CALL_CONTEXT_FILE": str(ctx_path) if ctx_path else "",
         })
         log_f = open(log_path, "ab")
         log_f.write(f"\n===== spawn {time.strftime('%Y-%m-%dT%H:%M:%S')} mode={mode} pipeline={env['LIVE_CALL_PIPELINE']} =====\n".encode())
@@ -404,14 +459,23 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
             raise RuntimeError(f"room server failed to start (see {log_path}). Last output: {tail}")
 
         # Public reachability, in order: explicit base > the always-on
-        # supervisor's tunnel > a per-call tunnel (fallback; dies with the
-        # agent turn, so it is the last resort).
+        # supervisor's tunnel > a per-call tunnel (last resort; it dies with
+        # the agent turn). When a supervisor is managing tunnels but has no
+        # healthy URL, do NOT mint another one — quick tunnels are rate-limited
+        # per IP, so piling on is what keeps the block alive.
         try:
-            base = (
-                os.environ.get("LIVE_CALL_PUBLIC_URL", "").rstrip("/")
-                or _published_tunnel()
-                or _start_tunnel(rec_dir / "tunnel.log")
-            )
+            base = os.environ.get("LIVE_CALL_PUBLIC_URL", "").rstrip("/") or _published_tunnel()
+            if not base:
+                if _supervisor_present():
+                    raise MissingDependency(
+                        "no public link is available right now — the tunnel service has "
+                        "no healthy URL (Cloudflare rate-limits quick tunnels per IP)",
+                        stage="tunnel",
+                        hint="check: systemctl --user status hermes-live-call-tunnel; "
+                             "for a permanent fix set LIVE_CALL_PUBLIC_URL to a named "
+                             "tunnel or your own reverse proxy",
+                    )
+                base = _start_tunnel(rec_dir / "tunnel.log")
         except Exception:
             try:
                 proc.terminate()
@@ -472,6 +536,12 @@ def stop_room(reason: str = "") -> Dict[str, Any]:
         _room, _proc, _control_secret = None, None, None
 
     _stop_tunnel()
+    if room is not None:
+        for leftover in _recordings_dir().glob(f"context-{room.token[:8]}.txt"):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
 
     if proc is None or proc.poll() is not None:
         if room is not None:

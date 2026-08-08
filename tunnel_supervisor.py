@@ -37,9 +37,18 @@ BIND = os.environ.get("LIVE_CALL_BIND", "127.0.0.1:8199")
 URL_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
 STARTUP_TIMEOUT_S = 60
 CHECK_INTERVAL_S = 15
+# Cloudflare rate-limits quick tunnels per source IP (HTTP 429 / error 1015).
+# Retrying every couple of minutes prolongs the block, so back off hard.
+RATE_LIMIT_BACKOFF_S = 20 * 60
+MAX_BACKOFF_S = 30 * 60
+RATE_LIMIT_MARKERS = ("429 Too Many Requests", "error code: 1015", "Too Many Requests")
 
 _proc: subprocess.Popen | None = None
 _stop = False
+
+
+class RateLimited(RuntimeError):
+    """Cloudflare refused to mint a quick tunnel (429 / error 1015)."""
 
 
 def log(msg: str) -> None:
@@ -59,6 +68,15 @@ def _cloudflared() -> str:
     sys.exit(2)
 
 
+def _recent_log(offset: int) -> str:
+    try:
+        with LOG_FILE.open("rb") as fh:
+            fh.seek(offset)
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
 def start_tunnel() -> tuple[subprocess.Popen, str]:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     f = open(LOG_FILE, "ab")
@@ -73,6 +91,13 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
     deadline = time.time() + STARTUP_TIMEOUT_S
     while time.time() < deadline:
         if proc.poll() is not None:
+            tail = _recent_log(offset)
+            if any(m in tail for m in RATE_LIMIT_MARKERS):
+                raise RateLimited(
+                    "Cloudflare is rate-limiting quick tunnels from this IP "
+                    "(429/1015). A named tunnel or your own reverse proxy "
+                    "(LIVE_CALL_PUBLIC_URL) avoids this entirely."
+                )
             raise RuntimeError("cloudflared exited during startup")
         try:
             with LOG_FILE.open("rb") as fh:
@@ -142,10 +167,24 @@ def main() -> int:
                         break
                 else:
                     misses = 0
+        except RateLimited as e:
+            # Publishing nothing is better than publishing a dead hostname:
+            # the plugin then reports an actionable error instead of handing
+            # the user a link that cannot resolve.
+            try:
+                URL_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            log(f"{e} Sleeping {RATE_LIMIT_BACKOFF_S // 60} min before retrying.")
+            for _ in range(RATE_LIMIT_BACKOFF_S):
+                if _stop:
+                    break
+                time.sleep(1)
+            backoff = 5
         except Exception as e:  # noqa: BLE001 — supervisor must never die
             log(f"error: {type(e).__name__}: {e}; retrying in {backoff}s")
             time.sleep(backoff)
-            backoff = min(backoff * 2, 120)
+            backoff = min(backoff * 2, MAX_BACKOFF_S)
         finally:
             if _proc and _proc.poll() is None and _stop:
                 _proc.terminate()
