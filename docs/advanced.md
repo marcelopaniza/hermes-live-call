@@ -44,7 +44,7 @@ in `$HERMES_HOME/.env`). See [.env.example](../.env.example).
 | `LIVE_CALL_BIND` | `127.0.0.1:8199` | Local listen address. Keep it on loopback. |
 | `LIVE_CALL_MODEL` | `gemini-3.1-flash-live-preview` | Realtime model id. |
 | `LIVE_CALL_PIPELINE` | auto | Force `echo` or `gemini`. Auto picks `gemini` when a key exists. |
-| `LIVE_CALL_MAX_CALL_S` | `1800` | Hard cap on a single call. |
+| `LIVE_CALL_MAX_CALL_S` | `1800` | Hard cap on a single call, enforced by the transport timeout and a watchdog. |
 | `LIVE_CALL_SYSTEM_FILE` | — | Replace the assembled persona with a file. |
 | `LIVE_CALL_CONTEXT` | `1` | `0` disables memory + conversation injection. |
 | `LIVE_CALL_OWNER_CHAT_ID` | from config | Override which chat counts as the owner. |
@@ -148,6 +148,15 @@ The room binds to loopback. A public entry point is chosen in this order:
    tunnel, its hostname written to `tunnel_url.txt` and re-read per call.
 3. **A per-call tunnel** — last resort, because a tunnel started inside an agent
    turn dies when that turn ends, leaving the user holding a dead link.
+
+> **If you front this with your own reverse proxy**, make sure it sets a
+> standard forwarded header (`X-Forwarded-For`, or Cloudflare's `CF-Connecting-IP`).
+> That header is how the room tells a public request from a local one — it is
+> what keeps `/control/stop` unreachable from the internet and keeps `/healthz`
+> from telling strangers your room state. nginx, Caddy and Traefik all set it by
+> default; a hand-rolled proxy might not. The stop endpoint still requires a
+> 192-bit secret that never leaves the host, so this is defence in depth rather
+> than the only lock.
 
 Quick tunnels are Cloudflare's testing tier: the hostname changes on restart,
 they cap at 200 concurrent in-flight requests, and creating many in a short

@@ -66,6 +66,18 @@ worth less than "here is what looking found":
 | Transcripts inherited the umask; state file was chmod'd after creation | Locally readable private content, and a brief window on the control secret |
 | Orphan cleanup signalled a stored pid unverified | Pid reuse could signal an unrelated process |
 
+A second review, run specifically against those fixes, found more — also
+corrected:
+
+| Issue | Why it mattered |
+|---|---|
+| The mint-time context snapshot was never deleted after a normal hang-up | The owner's memory was written to disk on every call and left there; cleanup only ran on a path a hang-up never takes. The room now deletes its own snapshot however the call ends. |
+| The call cap looked like two layers but was one | The transport's `session_timeout` raised an event with no handler registered, so only the watchdog enforced it — and the watchdog had no error handling, so one exception would have silently disabled the TTL reaper and the cap together. |
+| A pipeline failure was indistinguishable from a hang-up | A bad model key looked exactly like the caller hanging up. Errors are now recorded, surfaced over loopback, and closed with a distinct code. |
+| Transcript files were written then `chmod`'d | Same write-then-chmod window already closed for the state file. |
+| `sys.path` grew on every call, with very generic module names | In a process hosting several plugins, first import of `context`/`tools` wins the cache forever. Now loaded under a private name via `importlib`. |
+| Logs grew without bound | Rolled over at 5 MB. |
+
 ## Known limitations (accepted, not fixed)
 
 - **The token is in the URL.** It therefore appears in browser history and in
@@ -78,6 +90,10 @@ worth less than "here is what looking found":
   traffic. A self-hosted reverse proxy with your own certificate avoids this.
 - **The model provider processes your audio.** Unavoidable — it is the thing
   answering you. Nothing else is uploaded; transcripts stay local.
+- **A custom reverse proxy must set a forwarded header** (`X-Forwarded-For` or
+  `CF-Connecting-IP`) — that is how the room distinguishes public from local
+  requests. Mainstream proxies do this by default; the stop endpoint is still
+  secret-protected regardless.
 - **Dependencies are version-ranged, not hash-locked**, and `cloudflared` is
   pinned by version with its checksum printed at install rather than verified
   automatically.

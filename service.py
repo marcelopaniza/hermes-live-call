@@ -75,6 +75,8 @@ _tunnel_proc: Optional[subprocess.Popen] = None
 _control_secret: Optional[str] = None
 _probe_cache: Dict[str, Optional[str]] = {}
 
+_CONTEXT_MODULE = "live_call._context"
+_MAX_LOG_BYTES = 5 * 1024 * 1024
 _TUNNEL_TIMEOUT_S = 30
 _TRYCLOUDFLARE_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
 
@@ -82,6 +84,20 @@ _TRYCLOUDFLARE_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
 # ---------------------------------------------------------------------------
 # Environment resolution
 # ---------------------------------------------------------------------------
+
+def _open_log(path: Path):
+    """Append to a log, rolling it over once it gets large.
+
+    These files are opened for the lifetime of a subprocess and never rotated
+    by anything else, so without this they grow forever on a long-lived host.
+    """
+    try:
+        if path.exists() and path.stat().st_size > _MAX_LOG_BYTES:
+            path.replace(path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        pass
+    return open(path, "ab")
+
 
 def _bind() -> str:
     return os.environ.get("LIVE_CALL_BIND", DEFAULT_BIND)
@@ -165,7 +181,7 @@ def _start_tunnel(log_path: Path) -> str:
     # Only ever parse what THIS process writes: the log is append-only across
     # runs, and scanning the whole file hands back a previous (dead) tunnel's
     # URL — which is exactly how a 530 reached the user once.
-    f = open(log_path, "ab")
+    f = _open_log(log_path)
     f.write(f"\n===== tunnel {time.strftime('%Y-%m-%dT%H:%M:%S')} =====\n".encode())
     f.flush()
     start_offset = log_path.stat().st_size
@@ -289,6 +305,38 @@ def mint_token() -> str:
     return secrets.token_urlsafe(16)
 
 
+def _load_context_module():
+    """Import the plugin's context module without polluting sys.path/sys.modules.
+
+    This runs inside the long-lived gateway, which loads many plugins into one
+    interpreter; a bare ``import context`` would put a very generic name into
+    the shared module cache (first import wins, forever) and grow sys.path on
+    every call.
+    """
+    import importlib.util  # noqa: PLC0415
+
+    cached = sys.modules.get(_CONTEXT_MODULE)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(_CONTEXT_MODULE, ROOT / "context.py")
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load context module from {ROOT}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_CONTEXT_MODULE] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _discard_snapshot(path: Optional[Path]) -> None:
+    """Drop a context snapshot whose room never started."""
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _room_state_file() -> Path:
     return _recordings_dir() / "room.json"
 
@@ -401,10 +449,7 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
         # only moment we can attribute the request correctly.
         ctx_path = None
         try:
-            sys.path.insert(0, str(ROOT))
-            import context as _context  # noqa: PLC0415
-
-            block = _context.build(note=note)
+            block = _load_context_module().build(note=note)
             if block:
                 ctx_path = rec_dir / f"context-{token[:8]}.txt"
                 fd = os.open(ctx_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
@@ -428,7 +473,7 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
             "LIVE_CALL_RECORDINGS_DIR": str(rec_dir),
             "LIVE_CALL_CONTEXT_FILE": str(ctx_path) if ctx_path else "",
         })
-        log_f = open(log_path, "ab")
+        log_f = _open_log(log_path)
         log_f.write(f"\n===== spawn {time.strftime('%Y-%m-%dT%H:%M:%S')} mode={mode} pipeline={env['LIVE_CALL_PIPELINE']} =====\n".encode())
         proc = subprocess.Popen(
             [py, str(ROOT / "room_server.py")],
@@ -436,6 +481,7 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
             env=env, cwd=str(ROOT),
             start_new_session=True,
         )
+        log_f.close()   # the child holds its own dup of the fd now
 
         deadline = time.time() + _STARTUP_TIMEOUT_S
         hz = None
@@ -456,6 +502,7 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
             except OSError:
                 pass
             tail = _tail(log_path)
+            _discard_snapshot(ctx_path)
             raise RuntimeError(f"room server failed to start (see {log_path}). Last output: {tail}")
 
         # Public reachability, in order: explicit base > the always-on
@@ -481,6 +528,7 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
                 proc.terminate()
             except OSError:
                 pass
+            _discard_snapshot(ctx_path)
             raise
 
         _room = Room(token=token, mode=mode, note=note, created=time.time(), ttl_minutes=ttl_minutes)

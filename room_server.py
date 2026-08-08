@@ -19,6 +19,8 @@ Env contract (set by service.py):
   LIVE_CALL_NOTE             optional context from the requesting chat
   LIVE_CALL_SYSTEM_FILE      optional persona/system prompt file
   LIVE_CALL_TTL_S            link TTL for the unused-link watchdog
+  LIVE_CALL_MAX_CALL_S       hard cap on a single call (default 1800)
+  LIVE_CALL_CONTEXT_FILE     mint-time context snapshot; deleted at shutdown
   GEMINI_API_KEY             required for the gemini pipeline
 """
 
@@ -89,6 +91,7 @@ STATE = {
     "recording_path": None,   # TODO: MP4 recording
     "transcript_path": None,
     "call_started": None,
+    "last_error": None,
     "images": 0,
 }
 
@@ -172,9 +175,11 @@ class TranscriptWriter(FrameProcessor):
             os.chmod(path.parent, 0o700)   # transcripts are private
         except OSError:
             pass
-        path.write_text(f"# live_call transcript — started {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n",
-                        encoding="utf-8")
-        os.chmod(path, 0o600)   # a call transcript is private by default
+        # Created 0600 rather than written-then-chmod'd: a transcript is
+        # private from its first byte.
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"# live_call transcript — started {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
     def _write(self, line: str) -> None:
         with self._path.open("a", encoding="utf-8") as f:
@@ -274,6 +279,13 @@ async def _run_call(websocket: WebSocket) -> None:
             # is better UX than a silent line waiting to be talked at.
             await task.queue_frames([LLMRunFrame()])
 
+    @transport.event_handler("on_session_timeout")
+    async def _on_timeout(_t, _ws):
+        # The transport only RAISES this event; without a handler the
+        # session_timeout parameter does nothing at all.
+        log("session timeout reached — ending call")
+        await task.cancel()
+
     @transport.event_handler("on_client_disconnected")
     async def _on_disc(_t, _ws):
         # Hang-up must END the pipeline. Without this the room outlives the
@@ -333,6 +345,7 @@ async def healthz(request: Request):
         "used": STATE["used"],
         "images": STATE["images"],
         "age_s": int(time.time() - STATE["started"]),
+        "last_error": STATE["last_error"],
     }
 
 
@@ -372,7 +385,12 @@ async def ws(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:  # noqa: BLE001 — never kill the server on a call error
-        log(f"call error: {type(e).__name__}: {e}")
+        STATE["last_error"] = f"{type(e).__name__}: {e}"
+        log(f"call error: {STATE['last_error']}")
+        try:
+            await websocket.close(code=4500)   # distinct from a normal hang-up
+        except Exception:  # noqa: BLE001
+            pass
     finally:
         STATE["joined"] = False
         # A finished call ends the room: single-use by design.
@@ -386,16 +404,26 @@ async def _watchdog() -> None:
     over (the /ws handler normally closes it; this catches the edge cases)."""
     while _stop_event and not _stop_event.is_set():
         await asyncio.sleep(10)
-        if TTL_S and not STATE["used"] and time.time() - STATE["started"] > TTL_S:
-            log("TTL expired unused — self-terminating")
-            _stop_event.set()
-        elif STATE["used"] and not STATE["joined"] and (_call_task is None or _call_task.done()):
-            log("call finished — self-terminating")
-            _stop_event.set()
-        elif MAX_CALL_S and STATE["joined"] and STATE["call_started"] \
-                and time.time() - STATE["call_started"] > MAX_CALL_S:
-            log(f"call exceeded {MAX_CALL_S}s — ending it")
-            _stop_event.set()
+        try:
+            _watchdog_tick()
+        except Exception as e:  # noqa: BLE001
+            # An unhandled error here would silently disable the TTL reaper AND
+            # the call-duration cap for the rest of the process's life.
+            log(f"watchdog error (continuing): {type(e).__name__}: {e}")
+
+
+def _watchdog_tick() -> None:
+    """One reaper pass. Kept separate so a failure here cannot kill the loop."""
+    if TTL_S and not STATE["used"] and time.time() - STATE["started"] > TTL_S:
+        log("TTL expired unused — self-terminating")
+        _stop_event.set()
+    elif STATE["used"] and not STATE["joined"] and (_call_task is None or _call_task.done()):
+        log("call finished — self-terminating")
+        _stop_event.set()
+    elif (MAX_CALL_S and STATE["joined"] and STATE["call_started"]
+          and time.time() - STATE["call_started"] > MAX_CALL_S):
+        log(f"call exceeded {MAX_CALL_S}s — ending it")
+        _stop_event.set()
 
 
 def _write_state() -> None:
@@ -417,6 +445,21 @@ def _write_state() -> None:
         os.replace(tmp, STATE_FILE)
     except OSError as e:
         log(f"could not write state file: {e}")
+
+
+def _discard_context_snapshot() -> None:
+    """Delete the mint-time snapshot of the caller's private context.
+
+    The room must do this itself: a normal hang-up tears the room down from the
+    inside and never calls back into the gateway, so leaving cleanup to the
+    caller left the owner's memory sitting on disk after every single call.
+    """
+    if not CONTEXT_FILE:
+        return
+    try:
+        Path(CONTEXT_FILE).unlink(missing_ok=True)
+    except OSError as e:
+        log(f"could not remove context snapshot: {e}")
 
 
 def _clear_state() -> None:
@@ -462,6 +505,7 @@ async def amain() -> int:
         await asyncio.sleep(0.75)
     if not bound:
         log(f"FATAL: could not bind {host}:{port} — another room server is holding it")
+        _discard_context_snapshot()
         return 3
 
     server = uvicorn.Server(uvicorn.Config(
@@ -476,6 +520,7 @@ async def amain() -> int:
     if serve_task.done():
         log(f"FATAL: server exited during startup: {serve_task.exception()!r}")
         _clear_state()
+        _discard_context_snapshot()
         return 3
     watchdog = asyncio.create_task(_watchdog())
     log(f"listening on {BIND} (instance={INSTANCE[:8]}, pipeline={PIPELINE}, mode={MODE})")
@@ -494,6 +539,7 @@ async def amain() -> int:
     except (asyncio.TimeoutError, asyncio.CancelledError):
         pass
     _clear_state()
+    _discard_context_snapshot()
     log("clean shutdown")
     return 0
 
