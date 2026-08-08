@@ -154,33 +154,20 @@ channel. Anyone else gets their own conversation plus an explicit instruction no
 to disclose the owner's information. All reads are read-only (`PRAGMA query_only`),
 and any failure degrades to less context rather than a failed call.
 
-## Security notes
+## Security
 
-Reviewed adversarially before release (assuming an attacker knows the public
-hostname but not a token). Fixed as a result: memory was gated on a *display
-name*, which the other party chooses — now gated on the chat's stable platform
-id, bound to the caller at mint time so a link tapped later cannot pick up
-whoever spoke most recently; a used token could start a second call once the
-first ended; two callers could race the same link; `/control/stop` was
-reachable from the internet; `/healthz` told the public whether you were on a
-call; comparisons were not constant-time; transcripts inherited the umask.
+This puts a microphone endpoint on the public internet, so the short version:
+join links are single-use, expiring and 128-bit; only one call can run at a
+time and it is capped at 30 minutes; the stop endpoint is unreachable from the
+internet; memory is released only to the owner's own chat and is bound to the
+caller when the link is minted; transcripts stay on your disk at `0600`.
 
-Known and accepted: the join token appears in the URL (browser history and
-your tunnel provider's logs — inherent to "tap a link"), `/healthz` still
-answers liveness publicly (the tunnel supervisor needs it), and dependencies
-are version-ranged rather than hash-locked.
+Two things to know before you expose it: **the token travels in the URL** (so
+it lands in browser history and your tunnel provider's logs), and **your tunnel
+provider terminates TLS** unless you run your own proxy.
 
-- Join links are single-use with a 128-bit token and a TTL; the room self-closes
-  when the call ends and reaps itself if the link is never used.
-- The room server binds to loopback; only five routes are exposed (join page,
-  config read, audio socket, health, secret-guarded stop).
-- The health endpoint is public through the tunnel and deliberately exposes no
-  filesystem paths.
-- Recordings/transcripts stay on the host, written `0600` in a `0700`
-  directory. Recording anyone else requires their consent — check your
-  jurisdiction.
-- Calls are capped at `LIVE_CALL_MAX_CALL_S` (default 30 min) so a held-open
-  line cannot run up model cost or squat the single room slot.
+Full threat model, the findings from an adversarial review, and the accepted
+limitations: **[SECURITY.md](SECURITY.md)**.
 
 ## Development
 

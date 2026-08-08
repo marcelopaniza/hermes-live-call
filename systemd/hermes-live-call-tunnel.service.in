@@ -11,6 +11,9 @@ Environment="LIVE_CALL_BIND=127.0.0.1:8199"
 ExecStart=@PYTHON@ @PLUGIN_DIR@/tunnel_supervisor.py
 Restart=always
 RestartSec=10
+# Stop promptly and take the cloudflared child with us.
+TimeoutStopSec=20
+KillMode=mixed
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

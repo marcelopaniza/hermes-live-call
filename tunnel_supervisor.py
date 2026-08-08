@@ -23,6 +23,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,7 +45,10 @@ MAX_BACKOFF_S = 30 * 60
 RATE_LIMIT_MARKERS = ("429 Too Many Requests", "error code: 1015", "Too Many Requests")
 
 _proc: subprocess.Popen | None = None
-_stop = False
+# An Event, not a bare flag: every wait below is interruptible, so SIGTERM
+# stops the service promptly instead of systemd having to SIGKILL it after a
+# stop timeout (which risks orphaning the cloudflared child).
+_stop_evt = threading.Event()
 
 
 class RateLimited(RuntimeError):
@@ -89,7 +93,7 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
         stdout=f, stderr=subprocess.STDOUT,
     )
     deadline = time.time() + STARTUP_TIMEOUT_S
-    while time.time() < deadline:
+    while time.time() < deadline and not _stop_evt.is_set():
         if proc.poll() is not None:
             tail = _recent_log(offset)
             if any(m in tail for m in RATE_LIMIT_MARKERS):
@@ -107,8 +111,11 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
             hit = None
         if hit:
             return proc, hit.group(0).decode()
-        time.sleep(0.5)
+        if _sleep(0.5):
+            break
     proc.terminate()
+    if _stop_evt.is_set():
+        raise RuntimeError("stopping")
     raise RuntimeError(f"no tunnel URL within {STARTUP_TIMEOUT_S}s")
 
 
@@ -136,8 +143,12 @@ def edge_alive(url: str) -> bool:
 
 
 def _handle_signal(_signum, _frame) -> None:
-    global _stop
-    _stop = True
+    _stop_evt.set()
+
+
+def _sleep(seconds: float) -> bool:
+    """Sleep unless/until we are asked to stop. Returns True if stopping."""
+    return _stop_evt.wait(seconds)
 
 
 def main() -> int:
@@ -146,14 +157,15 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
 
     backoff = 5
-    while not _stop:
+    while not _stop_evt.is_set():
         try:
             _proc, url = start_tunnel()
             publish(url)
             backoff = 5
             misses = 0
-            while not _stop:
-                time.sleep(CHECK_INTERVAL_S)
+            while not _stop_evt.is_set():
+                if _sleep(CHECK_INTERVAL_S):
+                    break
                 if _proc.poll() is not None:
                     log("cloudflared exited — restarting")
                     break
@@ -176,17 +188,16 @@ def main() -> int:
             except OSError:
                 pass
             log(f"{e} Sleeping {RATE_LIMIT_BACKOFF_S // 60} min before retrying.")
-            for _ in range(RATE_LIMIT_BACKOFF_S):
-                if _stop:
-                    break
-                time.sleep(1)
+            _sleep(RATE_LIMIT_BACKOFF_S)
             backoff = 5
         except Exception as e:  # noqa: BLE001 — supervisor must never die
+            if _stop_evt.is_set():
+                break
             log(f"error: {type(e).__name__}: {e}; retrying in {backoff}s")
-            time.sleep(backoff)
+            _sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_S)
         finally:
-            if _proc and _proc.poll() is None and _stop:
+            if _proc and _proc.poll() is None and _stop_evt.is_set():
                 _proc.terminate()
 
     if _proc and _proc.poll() is None:
