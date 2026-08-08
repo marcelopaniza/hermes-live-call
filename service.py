@@ -447,6 +447,16 @@ def start_room(mode: str, note: str, ttl_minutes: int) -> Dict[str, Any]:
         # non-owner's link, tapped after the owner happens to message, would
         # open with the OWNER's memory and conversation. Minting time is the
         # only moment we can attribute the request correctly.
+        # Sweep snapshots orphaned by a crash (or by a version that predates
+        # self-cleanup): they hold private context and nothing else reaps them.
+        for stale in rec_dir.glob("context-*.txt"):
+            try:
+                if time.time() - stale.stat().st_mtime > 3600:
+                    stale.unlink()
+                    logger.info("live_call: removed stale context snapshot %s", stale.name)
+            except OSError:
+                pass
+
         ctx_path = None
         try:
             block = _load_context_module().build(note=note)
