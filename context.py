@@ -7,9 +7,11 @@ standing memory, and not the conversation that just asked for the call.
 Two sources, both read-only:
 
 1. **Built-in memory** — ``$HERMES_HOME/memories/{MEMORY.md,USER.md}``. These
-   describe the OWNER, so they are only injected for an owner conversation
-   (family members share this assistant; their calls must not receive
-   the owner's profile).
+   describe the OWNER, so they are only injected for an owner conversation,
+   identified by the chat's stable platform id (never its display name — that
+   is chosen by the person on the other end, so name matching would let anyone
+   claim the owner's memory by renaming themselves). Fails closed: if the
+   owner's chat id cannot be determined, no memory is injected.
 2. **The conversation that requested the call** — the most recently active
    non-CLI session in ``state.db``. A call is always started from a chat, so
    that chat is by definition the newest session at mint time. Scoping this
@@ -62,8 +64,16 @@ def load_memory() -> str:
     return "\n\n".join(blocks)
 
 
-def _owner_name() -> str:
-    """Owner display name from the gateway's home channel, if configured."""
+def _owner_chat_id() -> str:
+    """The owner's chat id, from env or the gateway's configured home channel.
+
+    A chat id (e.g. a WhatsApp LID) is assigned by the platform; a display name
+    is typed by the other party. Only the former is safe to authorize on.
+    """
+    override = os.environ.get("LIVE_CALL_OWNER_CHAT_ID", "").strip()
+    if override:
+        return override
+
     cfg_path = _hermes_home() / "config.yaml"
     try:
         import yaml
@@ -75,8 +85,8 @@ def _owner_name() -> str:
     def walk(node: Any) -> str:
         if isinstance(node, dict):
             hc = node.get("home_channel")
-            if isinstance(hc, dict) and isinstance(hc.get("name"), str):
-                return hc["name"]
+            if isinstance(hc, dict) and hc.get("chat_id"):
+                return str(hc["chat_id"])
             for v in node.values():
                 got = walk(v)
                 if got:
@@ -86,15 +96,15 @@ def _owner_name() -> str:
     return walk(cfg).strip()
 
 
-def recent_conversation() -> tuple[Optional[str], list[str]]:
-    """Return ``(display_name, transcript_lines)`` for the calling chat."""
+def recent_conversation() -> tuple[Optional[str], Optional[str], list[str]]:
+    """Return ``(display_name, chat_id, transcript_lines)`` for the calling chat."""
     db = _hermes_home() / "state.db"
     if not db.exists():
-        return None, []
+        return None, None, []
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
     except sqlite3.Error:
-        return None, []
+        return None, None, []
     try:
         con.execute("PRAGMA query_only = ON")
         placeholders = ",".join("?" for _ in SKIP_SOURCES)
@@ -102,17 +112,17 @@ def recent_conversation() -> tuple[Optional[str], list[str]]:
         # (the owner's) would otherwise lose to a chat whose session merely
         # started later — and the call would open with someone else's context.
         row = con.execute(
-            f"""SELECT s.id, s.display_name, MAX(m.timestamp) AS last_ts
+            f"""SELECT s.id, s.display_name, s.chat_id, MAX(m.timestamp) AS last_ts
                   FROM sessions s JOIN messages m ON m.session_id = s.id
                  WHERE s.source NOT IN ({placeholders}) AND s.archived = 0
                  GROUP BY s.id ORDER BY last_ts DESC LIMIT 1""",
             SKIP_SOURCES,
         ).fetchone()
         if not row:
-            return None, []
-        session_id, display_name, last_ts = row
+            return None, None, []
+        session_id, display_name, chat_id, last_ts = row
         if last_ts and (time.time() - float(last_ts)) > MAX_SESSION_AGE_S:
-            return display_name, []
+            return display_name, chat_id, []
 
         rows = con.execute(
             """SELECT role, content FROM messages
@@ -122,7 +132,7 @@ def recent_conversation() -> tuple[Optional[str], list[str]]:
             (session_id, MAX_MSGS),
         ).fetchall()
     except sqlite3.Error:
-        return None, []
+        return None, None, []
     finally:
         con.close()
 
@@ -134,14 +144,15 @@ def recent_conversation() -> tuple[Optional[str], list[str]]:
         if len(text) > MAX_MSG_CHARS:
             text = text[:MAX_MSG_CHARS].rstrip() + "…"
         lines.append(f"{'Them' if role == 'user' else 'You'}: {text}")
-    return display_name, lines
+    return display_name, chat_id, lines
 
 
 def build(note: str = "") -> str:
     """Assemble the context block appended to the call's system prompt."""
-    display_name, convo = recent_conversation()
-    owner = _owner_name()
-    is_owner = bool(owner and display_name and owner.lower() in display_name.lower())
+    display_name, chat_id, convo = recent_conversation()
+    owner_id = _owner_chat_id()
+    # Fail closed: no configured owner id, or no id on this chat, means no memory.
+    is_owner = bool(owner_id and chat_id and str(chat_id) == owner_id)
 
     parts: list[str] = []
     if is_owner:

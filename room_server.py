@@ -25,6 +25,7 @@ Env contract (set by service.py):
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import signal
@@ -94,6 +95,21 @@ def log(msg: str) -> None:
     print(f"[room_server {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _same(a: str, b: str) -> bool:
+    """Constant-time compare for tokens and secrets."""
+    return hmac.compare_digest(str(a or ""), str(b or ""))
+
+
+def _via_tunnel(request) -> bool:
+    """True when the request arrived through the public tunnel.
+
+    cloudflared connects to loopback, so the peer address cannot distinguish
+    public from local traffic — but it injects these headers, and a local
+    caller does not.
+    """
+    return any(h in request.headers for h in ("cf-ray", "cf-connecting-ip", "x-forwarded-for"))
+
+
 def _persona() -> str:
     """Same identity as the chat assistant (SOUL.md + active personality)."""
     import persona as persona_mod
@@ -137,6 +153,7 @@ class TranscriptWriter(FrameProcessor):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"# live_call transcript — started {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n",
                         encoding="utf-8")
+        os.chmod(path, 0o600)   # a call transcript is private by default
 
     def _write(self, line: str) -> None:
         with self._path.open("a", encoding="utf-8") as f:
@@ -264,7 +281,7 @@ app = FastAPI()
 
 @app.get("/join/{token}")
 async def join(token: str):
-    if STATE["stopping"] or token != TOKEN:
+    if STATE["stopping"] or not _same(token, TOKEN):
         return PlainTextResponse("no such room (link expired or already used)", status_code=404)
     if STATE["used"] and not STATE["joined"]:
         return PlainTextResponse("this link was already used", status_code=410)
@@ -273,14 +290,17 @@ async def join(token: str):
 
 @app.get("/config")
 async def config(token: str = ""):
-    if token != TOKEN:
+    if not _same(token, TOKEN):
         return JSONResponse({"error": "bad token"}, status_code=403)
     return {"mode": MODE, "inRate": IN_RATE, "outRate": OUT_RATE, "pipeline": PIPELINE}
 
 
 @app.get("/healthz")
-async def healthz():
-    # Publicly reachable through the tunnel — no filesystem paths here.
+async def healthz(request: Request):
+    # Public callers (tunnel edge probes) get liveness only — room state is
+    # nobody else's business. Local callers get the detail the plugin needs.
+    if _via_tunnel(request):
+        return {"ok": True}
     return {
         "ok": True,
         "instance": INSTANCE,
@@ -296,7 +316,11 @@ async def healthz():
 
 @app.post("/control/stop")
 async def control_stop(request: Request):
-    if not SECRET or request.headers.get("x-control-secret") != SECRET:
+    # Never accept a stop from the internet: it would be a free call-killer for
+    # anyone who learned the hostname.
+    if _via_tunnel(request):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not SECRET or not _same(request.headers.get("x-control-secret", ""), SECRET):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     STATE["stopping"] = True
     log("stop requested via control endpoint")
@@ -309,15 +333,17 @@ async def control_stop(request: Request):
 async def ws(websocket: WebSocket):
     global _call_task
     token = websocket.query_params.get("token", "")
-    if token != TOKEN or STATE["stopping"]:
+    if not _same(token, TOKEN) or STATE["stopping"]:
         await websocket.close(code=4403)
         return
-    if _call_task is not None and not _call_task.done():
+    # Reserve the room BEFORE any await: two callers arriving together would
+    # otherwise both pass a check-then-act gate and fight over the pipeline.
+    if STATE["used"] or (_call_task is not None and not _call_task.done()):
         await websocket.close(code=4409)   # a caller is already connected
         return
+    STATE["used"] = True
 
     await websocket.accept()
-    STATE["used"] = True
     _call_task = asyncio.create_task(_run_call(websocket))
     try:
         await _call_task

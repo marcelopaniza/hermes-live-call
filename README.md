@@ -1,3 +1,14 @@
+<p align="center">
+  <img src="docs/banner.svg" alt="live_call — talk to your Hermes agent on a real voice call" width="100%">
+</p>
+
+<p align="center">
+  <a href="#install"><img src="https://img.shields.io/badge/install-2%20commands-3ddc84?style=flat-square" alt="install"></a>
+  <img src="https://img.shields.io/badge/tests-22%20passing-3ddc84?style=flat-square" alt="tests">
+  <img src="https://img.shields.io/badge/license-MIT-2f6fed?style=flat-square" alt="MIT">
+  <img src="https://img.shields.io/badge/python-3.10%2B-2f6fed?style=flat-square" alt="python 3.10+">
+</p>
+
 # live_call — talk to your Hermes agent on a real voice call
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that lets your
