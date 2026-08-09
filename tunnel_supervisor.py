@@ -46,8 +46,8 @@ BIND = os.environ.get("LIVE_CALL_BIND", "127.0.0.1:8199")
 # cloudflared instances on the same host (e.g. another tunnel service) claim
 # ports in the same range, and pinning one would both collide with them and let
 # us read THEIR readiness and call our own dead tunnel healthy.
-METRICS_RE = re.compile(rb"metrics server on (127\.0\.0\.1:\d+)")
-CONNECTOR_RE = re.compile(rb"Generated Connector ID: ([0-9a-fA-F-]{36})")
+METRICS_RE = re.compile(r"metrics server on (127\.0\.0\.1:\d+)")
+CONNECTOR_RE = re.compile(r"Generated Connector ID: ([0-9a-fA-F-]{36})")
 URL_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
 STARTUP_TIMEOUT_S = 60
 CHECK_INTERVAL_S = 15
@@ -125,12 +125,14 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
         except OSError:
             hit = None
         if hit:
-            blob = _recent_log(offset)
-            m = METRICS_RE.search(blob)
-            c = CONNECTOR_RE.search(blob)
             global _metrics_addr, _connector_id
-            _metrics_addr = m.group(1).decode() if m else ""
-            _connector_id = c.group(1).decode() if c else ""
+            _metrics_addr, _connector_id = "", ""
+            try:
+                _metrics_addr, _connector_id = parse_tunnel_details(_recent_log(offset))
+            except Exception as e:  # noqa: BLE001
+                # A working tunnel must never be lost to a parsing slip; health
+                # simply falls back to process liveness.
+                log(f"could not read metrics details ({type(e).__name__}: {e})")
             log(f"metrics at {_metrics_addr or 'unknown'}, connector {_connector_id[:8] or '?'}")
             return proc, hit.group(0).decode()
         if _sleep(0.5):
@@ -139,6 +141,13 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
     if _stop_evt.is_set():
         raise RuntimeError("stopping")
     raise RuntimeError(f"no tunnel URL within {STARTUP_TIMEOUT_S}s")
+
+
+def parse_tunnel_details(blob: str) -> tuple[str, str]:
+    """Pull cloudflared's metrics address and connector id out of its log."""
+    m = METRICS_RE.search(blob)
+    c = CONNECTOR_RE.search(blob)
+    return (m.group(1) if m else ""), (c.group(1) if c else "")
 
 
 def publish(url: str) -> None:
