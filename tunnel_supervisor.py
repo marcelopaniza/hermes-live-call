@@ -18,6 +18,7 @@ State file: ``$LIVE_CALL_STATE_DIR/tunnel_url.txt`` (default
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -35,6 +36,18 @@ STATE_DIR = Path(os.environ.get("LIVE_CALL_STATE_DIR", HERMES_HOME / "workspace"
 URL_FILE = STATE_DIR / "tunnel_url.txt"
 LOG_FILE = STATE_DIR / "tunnel.log"
 BIND = os.environ.get("LIVE_CALL_BIND", "127.0.0.1:8199")
+# Health MUST be judged at cloudflared's own metrics endpoint, not by fetching
+# through the tunnel: between calls there is no room listening, so the edge
+# legitimately errors while the tunnel is perfectly healthy. Recycling on that
+# minted a new tunnel every idle minute — which is what gets the source IP
+# rate-limited.
+#
+# The port is DISCOVERED from cloudflared's log rather than fixed: other
+# cloudflared instances on the same host (e.g. another tunnel service) claim
+# ports in the same range, and pinning one would both collide with them and let
+# us read THEIR readiness and call our own dead tunnel healthy.
+METRICS_RE = re.compile(rb"metrics server on (127\.0\.0\.1:\d+)")
+CONNECTOR_RE = re.compile(rb"Generated Connector ID: ([0-9a-fA-F-]{36})")
 URL_RE = re.compile(rb"https://[a-z0-9-]+\.trycloudflare\.com")
 STARTUP_TIMEOUT_S = 60
 CHECK_INTERVAL_S = 15
@@ -45,6 +58,8 @@ MAX_BACKOFF_S = 30 * 60
 RATE_LIMIT_MARKERS = ("429 Too Many Requests", "error code: 1015", "Too Many Requests")
 
 _proc: subprocess.Popen | None = None
+_metrics_addr = ""
+_connector_id = ""
 # An Event, not a bare flag: every wait below is interruptible, so SIGTERM
 # stops the service promptly instead of systemd having to SIGKILL it after a
 # stop timeout (which risks orphaning the cloudflared child).
@@ -110,6 +125,13 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
         except OSError:
             hit = None
         if hit:
+            blob = _recent_log(offset)
+            m = METRICS_RE.search(blob)
+            c = CONNECTOR_RE.search(blob)
+            global _metrics_addr, _connector_id
+            _metrics_addr = m.group(1).decode() if m else ""
+            _connector_id = c.group(1).decode() if c else ""
+            log(f"metrics at {_metrics_addr or 'unknown'}, connector {_connector_id[:8] or '?'}")
             return proc, hit.group(0).decode()
         if _sleep(0.5):
             break
@@ -127,19 +149,31 @@ def publish(url: str) -> None:
     log(f"published {url}")
 
 
-def edge_alive(url: str) -> bool:
-    """The room may be down (that is fine); we only need the EDGE to answer.
+def tunnel_healthy(_url: str) -> bool:
+    """Is OUR tunnel up — regardless of whether a room is currently listening?
 
-    Any HTTP status proves Cloudflare can reach cloudflared. 502/1033-class
-    failures raise, which is what we want to detect.
+    ``/ready`` reports cloudflared's registered edge connections. The
+    connector id is checked too, so another cloudflared on this host answering
+    the same port cannot make a dead tunnel of ours look alive.
     """
+    if not _metrics_addr:
+        return _proc is not None and _proc.poll() is None
     try:
-        with urllib.request.urlopen(f"{url}/healthz", timeout=8) as r:
-            return r.status < 500
-    except urllib.error.HTTPError as e:
-        return e.code < 500
-    except Exception:
+        with urllib.request.urlopen(f"http://{_metrics_addr}/ready", timeout=5) as r:
+            if r.status != 200:
+                return False
+            body = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError:
         return False
+    except Exception:
+        # Metrics unreachable: fall back to process liveness rather than
+        # tearing down a tunnel that may be fine.
+        return _proc is not None and _proc.poll() is None
+
+    if _connector_id and body.get("connectorId") not in (None, _connector_id):
+        log("metrics port answered by a different cloudflared — ignoring it")
+        return _proc is not None and _proc.poll() is None
+    return int(body.get("readyConnections") or 0) > 0
 
 
 def _handle_signal(_signum, _frame) -> None:
@@ -169,12 +203,12 @@ def main() -> int:
                 if _proc.poll() is not None:
                     log("cloudflared exited — restarting")
                     break
-                if not edge_alive(url):
+                if not tunnel_healthy(url):
                     misses += 1
-                    # The room server is often down between calls, so only a
-                    # sustained edge failure counts as a dead tunnel.
+                    # Only a sustained failure of cloudflared's own readiness
+                    # counts; a single blip must not cost a new tunnel.
                     if misses >= 4:
-                        log("edge unreachable for ~1min — recycling tunnel")
+                        log("cloudflared not ready for ~1min — recycling tunnel")
                         _proc.terminate()
                         break
                 else:
